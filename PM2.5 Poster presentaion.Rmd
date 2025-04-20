@@ -1,0 +1,287 @@
+---
+title: "PM2.5 poster presentation"
+author: "Nelson Bronya"
+date: "2025-04-20"
+output: html_document
+---
+
+
+
+
+
+
+
+```{r}
+# --------------------------
+# Hypertension-Pollution-Poverty Analysis
+# Final R Script (Cleaned + Working)
+# Nelson Anyim Bronya, Central Michigan University
+# --------------------------
+
+### 1. Setup Environment ------------------------------------------------------
+root.dir <- "/Users/phada/Downloads/RS"
+setwd(root.dir)
+
+# Install required packages
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse, mgcv, mediation, cluster, sf, tigris,
+  ggrepel, janitor, broom, modelsummary
+)
+
+options(tigris_use_cache = TRUE)
+set.seed(2023)
+
+### 2. Data Preparation -------------------------------------------------------
+final_data <- final_data_clean %>%
+  rename(
+    pm25 = PM25,
+    county = cnty_fips,
+    hpt_prevalence = HPT,
+    median_income = Median_HH_Income,
+    poverty_rate = Pct_Poverty,
+    urban_index = Urban_Rural  # continuous version
+  )
+
+required_cols <- c("county", "hpt_prevalence", "pm25", 
+                   "median_income", "poverty_rate", "urban_index")
+if (!all(required_cols %in% names(final_data))) {
+  stop("Missing required columns: ", 
+       paste(setdiff(required_cols, names(final_data)), collapse = ", "))
+}
+
+### 3. Generalized Additive Model (GAM) ----------------------------------------
+gam_model <- gam(
+  hpt_prevalence ~ s(pm25, bs = "cr") + 
+    s(median_income) + s(poverty_rate) + s(urban_index),
+  data = final_data,
+  method = "REML"
+)
+
+pm25_range <- seq(min(final_data$pm25), max(final_data$pm25), length.out = 100)
+gam_pred <- predict(gam_model, 
+                    newdata = tibble(
+                      pm25 = pm25_range,
+                      median_income = mean(final_data$median_income, na.rm = TRUE),
+                      poverty_rate = mean(final_data$poverty_rate, na.rm = TRUE),
+                      urban_index = mean(final_data$urban_index, na.rm = TRUE)
+                    ), 
+                    se.fit = TRUE)
+
+ggplot(tibble(pm25 = pm25_range, pred = gam_pred$fit), aes(pm25, pred)) +
+  geom_ribbon(aes(ymin = pred - 1.96*gam_pred$se.fit, 
+                  ymax = pred + 1.96*gam_pred$se.fit), alpha = 0.2) +
+  geom_line(color = "darkred", linewidth = 1) +
+  geom_vline(xintercept = c(9, 10), linetype = "dashed") +
+  labs(title = "PM2.5-Hypertension Relationship with 95% CI",
+       x = "PM₂.₅ (µg/m³)", y = "Predicted Hypertension Prevalence (%)") +
+  theme_minimal(base_size = 14) -> gam_plot
+
+### 4. Mediation Analysis -----------------------------------------------------
+med_model <- mediate(
+  model.m = lm(poverty_rate ~ pm25 + urban_index, data = final_data),
+  model.y = lm(hpt_prevalence ~ pm25 + poverty_rate + urban_index, data = final_data),
+  treat = "pm25",
+  mediator = "poverty_rate",
+  boot = TRUE,
+  sims = 1000
+)
+
+summary(med_model)
+
+mediation_results <- tibble(
+  ACME = med_model$d0,
+  ADE = med_model$z0,
+  Total_Effect = med_model$tau.coef,
+  Prop_Mediated = med_model$n0
+)
+
+### 5. Spatial Clustering -----------------------------------------------------
+# Michigan shapefile
+mi_shape <- counties(state = "MI", cb = TRUE, year = 2021) %>% 
+  st_transform(4326) %>%
+  janitor::clean_names() %>%
+  dplyr::rename(county_name = namelsad) %>%
+  dplyr::select(county_name, geometry)
+
+# Merge shapefile with analysis data — assuming common name column
+spatial_data <- mi_shape %>% 
+  left_join(final_data, by = c("county_name" = "county"))
+
+# K-means clustering
+cluster_vars <- spatial_data %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(pm25, median_income, hpt_prevalence) %>% 
+  scale()
+
+kmeans_result <- kmeans(cluster_vars, centers = 3, nstart = 25)
+spatial_data$cluster <- factor(kmeans_result$cluster)
+- factor(kmeans_result$cluster)
+
+# Plot clusters
+ggplot(spatial_data) +
+  geom_sf(aes(fill = cluster), color = "white", size = 0.2) +
+  scale_fill_viridis_d(name = "Risk Cluster", option = "plasma") +
+  labs(title = "Spatial Clusters of Hypertension Risk",
+       subtitle = "K-means clustering based on PM2.5, Income, and HPT Prevalence") +
+  theme_void(base_size = 14) -> cluster_map
+
+### 6. Cost-Benefit Analysis --------------------------------------------------
+cost_analysis <- final_data %>%
+  mutate(
+    pm25_reduced = pm25 * 0.9,
+    current_risk = predict(gam_model, newdata = .),
+    reduced_risk = predict(gam_model, newdata = mutate(., pm25 = pm25_reduced)),
+    population = ifelse(is.na(population), 100000, population),  # Default pop if missing
+    cases_prevented = (current_risk - reduced_risk)/100 * population,
+    cost_savings = cases_prevented * 1667
+  )
+
+total_savings <- sum(cost_analysis$cost_savings, na.rm = TRUE)
+
+### 7. Save Outputs -----------------------------------------------------------
+if(!dir.exists("output")) dir.create("output")
+
+write_csv(mediation_results, "output/mediation_results.csv")
+write_rds(gam_model, "output/gam_model.rds")
+saveRDS(kmeans_result, "output/kmeans_model.rds")
+
+ggsave("output/pm25_hpt_relationship.png", gam_plot, width = 10, height = 6)
+ggsave("output/risk_cluster_map.png", cluster_map, width = 12, height = 8)
+
+capture.output(sessionInfo(), file = "output/session_info.txt")
+
+### 8. Final Summary ----------------------------------------------------------
+cat("Analysis Summary:\n",
+    "Total estimated annual savings: $", format(total_savings, big.mark = ","), "\n",
+    "Proportion mediated by poverty: ", round(mediation_results$Prop_Mediated*100, 1), "%\n",
+    "Number of clusters identified: ", length(unique(kmeans_result$cluster)), "\n",
+    file = "output/results_summary.txt")
+
+```
+```{r}
+# --------------------------
+# Hypertension-Pollution-Poverty Analysis
+# Complete Reproducible R Script
+# Nelson Anyim Bronya, Central Michigan University
+# --------------------------
+
+### 1. Setup Environment ------------------------------------------------------
+# Set working directory
+root.dir <- "/Users/phada/Downloads/RS"
+setwd(root.dir)
+
+# Install required packages
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse, mgcv, mediation, cluster, sf, tigris,
+  ggrepel, janitor, broom, modelsummary, qrencoder,
+  plotly, ggalluvial, randomForest, ggridges
+)
+
+set.seed(2023) # For reproducibility
+
+### 2. Data Preparation -------------------------------------------------------
+# Load and clean data
+final_data <- read_csv("final_data_clean.csv") %>%
+  rename(
+    county = cnty_fips,
+    hpt_prevalence = HPT,
+    pm25 = PM25,
+    median_income = Median_HH_Income,
+    poverty_rate = Pct_Poverty,
+    rucc_code = Urban_Rural,
+    population = Population
+  ) %>%
+  mutate(
+    urban_rural = case_when(
+      rucc_code %in% 1:3 ~ "Urban",
+      rucc_code %in% 4:9 ~ "Rural",
+      TRUE ~ NA_character_
+    ) %>% factor(levels = c("Urban", "Rural")),
+    cluster = factor(Cluster)
+  )
+
+# Verify required columns
+required_cols <- c("county", "hpt_prevalence", "pm25", 
+                  "median_income", "poverty_rate", "urban_rural")
+if(!all(required_cols %in% names(final_data))) {
+  stop("Missing columns: ", paste(setdiff(required_cols, names(final_data)), collapse = ", "))
+}
+
+### 3. GAM Modeling (Corrected) -----------------------------------------------
+# Check factor levels first
+table(final_data$urban_rural)
+
+# If only 1 level exists, convert to numeric or recreate the factor properly
+final_data <- final_data %>%
+  mutate(
+    urban_rural = case_when(
+      rucc_code %in% 1:3 ~ "Urban",
+      rucc_code %in% 4:9 ~ "Rural",
+      TRUE ~ "Mixed"  # Add third category if needed
+    ) %>% factor(levels = c("Urban", "Rural", "Mixed"))
+  )
+
+# Verify 2+ levels exist
+stopifnot("urban_rural needs ≥2 levels" = nlevels(final_data$urban_rural) > 1)
+
+# Now run GAM
+gam_model <- gam(
+  hpt_prevalence ~ s(pm25, bs = "cr") + 
+    s(median_income) + s(poverty_rate) + urban_rural,
+  data = final_data,
+  method = "REML"
+)
+
+### 4. Mediation Analysis -----------------------------------------------------
+med_model <- mediate(
+  lm(poverty_rate ~ pm25 + urban_rural, final_data),
+  lm(hpt_prevalence ~ pm25 + poverty_rate + urban_rural, final_data),
+  treat = "pm25", mediator = "poverty_rate",
+  boot = TRUE, sims = 500
+)
+
+### 5. Spatial Analysis -------------------------------------------------------
+mi_shape <- tigris::counties("MI", year = 2021) %>%
+  left_join(final_data, by = c("NAMELSAD" = "county"))
+
+# K-means clustering
+cluster_data <- final_data %>%
+  select(pm25, median_income, hpt_prevalence) %>%
+  scale()
+kmeans_result <- kmeans(cluster_data, centers = 3, nstart = 25)
+
+### 6. Visualizations ---------------------------------------------------------
+# GAM Plot
+ggplot(final_data, aes(pm25, hpt_prevalence)) +
+  geom_point(aes(color = median_income)) +
+  geom_smooth(method = "gam", color = "#00FFE5") +
+  theme(plot.background = element_rect(fill = "transparent"))
+
+# Sankey Diagram
+ggplot(med_df, aes(axis1 = "PM2.5", axis2 = c("Income", "Poverty"), y = c(58.1, 28.3))) +
+  geom_alluvium(aes(fill = Mediator)) +
+  scale_fill_manual(values = c("#00F0FF", "#FF00FF"))
+
+# 3D Cluster Plot
+plot_ly(final_data, x = ~pm25, y = ~hpt_prevalence, z = ~median_income,
+        color = ~cluster, colors = c("#FF0000", "#00FF00", "#0000FF"))
+
+### 7. QR Code Generation -----------------------------------------------------
+qr <- qrencode_raster("https://github.com/Nelbro/Research")
+png("qrcode.png", width = 300, height = 300)
+par(mar = c(0,0,0,0))
+plot(as.raster(qr))
+dev.off()
+
+### 8. Save Results -----------------------------------------------------------
+saveRDS(gam_model, "gam_model.rds")
+write_csv(broom::tidy(med_model), "mediation_results.csv")
+ggsave("all_plots.png", last_plot(), width = 16, height = 9, dpi = 300)
+
+# Generate session info
+capture.output(sessionInfo(), file = "session_info.txt")
+```
+  
+  

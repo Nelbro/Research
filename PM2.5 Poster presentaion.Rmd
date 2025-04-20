@@ -1,6 +1,6 @@
 ---
 title: "PM2.5 poster presentation"
-author: "Nelson Bronya"
+author: "NelBro"
 date: "2025-04-20"
 output: html_document
 ---
